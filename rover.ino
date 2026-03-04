@@ -32,6 +32,7 @@ const int REQUIRED_UNIQUE_SAMPLES = 800;
 WebServer server(80);
 Preferences preferences;
 TinyGPSPlus gps;
+HardwareSerial GPSSerial(1);
 
 bool mpuOk = false;
 bool magOk = false;
@@ -68,6 +69,13 @@ bool userHornActive = false;
 unsigned long lastObstacleCheck = 0;
 unsigned long crashTime = 0;
 
+// === GPS GLOBALS ===
+double gpsLat = 0.0;
+double gpsLng = 0.0;
+float gpsSpeed = 0.0f; // km/h
+int gpsSat = 0;
+bool gpsFix = false;
+
 // ================= WEB DASHBOARD HTML/CSS/JS =================
 const char INDEX_HTML[] PROGMEM = R"=====(
 <!DOCTYPE html>
@@ -75,11 +83,12 @@ const char INDEX_HTML[] PROGMEM = R"=====(
 <head>
   <title>ESP32 Advanced Telemetry & Control</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <style>
     body { background-color: #0d1117; color: #00ff00; font-family: 'Courier New', Courier, monospace; margin: 10px; display: flex; flex-direction: column; align-items: center;}
     h1 { color: #58a6ff; border-bottom: 1px solid #30363d; padding-bottom: 10px; width: 100%; text-align: center; font-size: 1.2em;}
-    .container { max-width: 600px; width: 100%; }
-    .card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 15px; margin-bottom: 15px; }
+    .container { max-width: 1200px; width: 100%; display: grid; grid-template-columns: repeat(auto-fit, minmax(320px,1fr)); gap: 15px; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 15px; margin-bottom: 0; }
     button { background: #238636; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-weight: bold; margin-right: 10px; width: 100%; margin-bottom: 10px;}
     button:hover { background: #2ea043; }
     .btn-danger { background: #da3633; }
@@ -105,13 +114,62 @@ const char INDEX_HTML[] PROGMEM = R"=====(
     #car-status { color: #00ff00; text-align: center; font-weight: bold; margin-bottom: 10px; font-size: 1.1em; transition: 0.2s;}
     input[type=range] { width: 90%; margin: 15px 0; }
     .speed-label { font-size: 1.1em; font-weight: bold; color: #58a6ff; }
+    #map { width: 100%; height: 260px; border: 1px solid #30363d; border-radius: 6px; }
+    #real-speed { font-size: 1.2em; color: #58a6ff; font-weight: bold; margin-top: 10px; text-align: center; }
+    #gps-meta { text-align: center; color: #8b949e; font-size: 0.9em; margin-top: 4px; }
+    @media (max-width: 480px) {
+      #map { height: 220px; }
+    }
+
+    /* Mobile full-screen control layout */
+    @media (max-width: 768px) {
+      body { margin: 6px; min-height: 100dvh; overflow-y: auto; }
+      h1 { margin: 0 0 6px 0; padding-bottom: 6px; font-size: 0.95em; }
+      .container {
+        max-width: 100%;
+        width: 100%;
+        min-height: calc(100dvh - 52px);
+        grid-template-columns: 1fr 1fr;
+        grid-template-rows: repeat(2, minmax(0, 1fr));
+        grid-template-areas:
+          "gps controls"
+          "compass controls";
+        gap: 6px;
+      }
+      .card { padding: 8px; overflow: hidden; }
+      .card h3 { margin: 0 0 6px 0; font-size: 0.9em; }
+      #gps-card { grid-area: gps; }
+      #controls-card { grid-area: controls; }
+      #compass-card { grid-area: compass; }
+      #cal-card, #telemetry-card { display: none; }
+      #map { height: 68%; min-height: 120px; }
+      #real-speed { font-size: 1em; margin-top: 6px; }
+      #gps-meta { font-size: 0.8em; }
+      #compass-svg { width: 100px; height: 100px; margin: 4px auto; }
+      #heading-val { font-size: 1.2em; }
+      .drive-btn { padding: 12px 4px; font-size: 0.78em; margin: 1px; }
+      button { margin-bottom: 6px; padding: 8px 6px; }
+      input[type=range] { width: 100%; margin: 8px 0; }
+      .speed-label { font-size: 0.95em; }
+      #car-status { margin-bottom: 6px; font-size: 0.9em; }
+    }
   </style>
 </head>
 <body>
   <h1>[ ESP32-S3 ] TELEMETRY & CONTROL</h1>
+  <div style="width:100%;max-width:1200px;display:flex;justify-content:flex-end;margin-bottom:8px;">
+    <button style="width:auto;margin:0;padding:8px 12px;" onclick="refreshDashboard()">Refresh</button>
+  </div>
   
   <div class="container">
-    <div class="card">
+    <div class="card" id="gps-card">
+      <h3>GPS MAP + SPEED</h3>
+      <div id="map"></div>
+      <div id="real-speed">REAL SPEED: 0.00 km/h</div>
+      <div id="gps-meta">SAT: <span id="sat-val">0</span></div>
+    </div>
+
+    <div class="card" id="cal-card">
       <h3>MAGNETOMETER CALIBRATION</h3>
       <div id="instructions">
         <strong>ACTION REQUIRED:</strong><br>
@@ -125,7 +183,7 @@ const char INDEX_HTML[] PROGMEM = R"=====(
       <button class="btn-danger" id="btn-reset" onclick="fetch('/reset_cal')">Reset to Defaults</button>
     </div>
 
-    <div class="card">
+    <div class="card" id="controls-card">
       <h3>CAR CONTROLS</h3>
       <div id="car-status">SYSTEM READY</div>
       <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap: 5px; text-align:center;">
@@ -150,7 +208,7 @@ const char INDEX_HTML[] PROGMEM = R"=====(
       </div>
     </div>
 
-    <div class="card">
+    <div class="card" id="compass-card">
       <div id="heading-val">0.0&deg;</div>
       <svg id="compass-svg" viewBox="0 0 150 150">
         <circle class="compass-ring" cx="75" cy="75" r="70"/>
@@ -163,13 +221,39 @@ const char INDEX_HTML[] PROGMEM = R"=====(
       </svg>
     </div>
 
-    <div class="card">
+    <div class="card" id="telemetry-card">
       <h3>SYSTEM DATA</h3>
       <div id="data">Loading...</div>
     </div>
   </div>
 
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
+    let map = null;
+    let roverMarker = null;
+
+    if (window.L) {
+      map = L.map('map').setView([0, 0], 16);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; OpenStreetMap contributors'
+      }).addTo(map);
+
+      roverMarker = L.marker([0, 0]).addTo(map);
+
+      // Fix Leaflet rendering inside responsive grid
+      setTimeout(() => map.invalidateSize(), 200);
+    } else {
+      document.getElementById('map').innerHTML = "<div style='display:flex;align-items:center;justify-content:center;height:100%;color:#8b949e;'>Map unavailable (no internet for Leaflet)</div>";
+    }
+
+    function updateMap(lat, lng) {
+      if (map && roverMarker && !isNaN(lat) && !isNaN(lng) && (lat !== 0 || lng !== 0)) {
+        roverMarker.setLatLng([lat, lng]);
+        map.setView([lat, lng], map.getZoom());
+      }
+    }
+
     function startCalibration() {
       document.getElementById('instructions').style.display = 'block';
       document.getElementById('progress-container').style.display = 'block';
@@ -181,6 +265,7 @@ const char INDEX_HTML[] PROGMEM = R"=====(
     function drive(dir) { fetch('/move?dir=' + dir); }
     function horn(state) { fetch('/horn?s=' + state); }
     function updateSpeed(val) { fetch('/speed?v=' + val); }
+    function refreshDashboard() { window.location.href = '/?t=' + Date.now(); }
 
     setInterval(() => {
       fetch('/data')
@@ -188,6 +273,9 @@ const char INDEX_HTML[] PROGMEM = R"=====(
         .then(data => {
           document.getElementById('compass-needle').style.transform = `rotate(${data.heading}deg)`;
           document.getElementById('heading-val').innerHTML = `${data.heading.toFixed(1)}&deg;`;
+          document.getElementById('real-speed').innerText = `REAL SPEED: ${data.speed.toFixed(2)} km/h`;
+          document.getElementById('sat-val').innerText = data.sat;
+          updateMap(data.lat, data.lng);
 
           let statusEl = document.getElementById('car-status');
           if (data.crashed) {
@@ -218,8 +306,12 @@ const char INDEX_HTML[] PROGMEM = R"=====(
               <tr><th>Mag Offsets</th><td>X:${data.offX}, Y:${data.offY}, Z:${data.offZ}</td></tr>
               <tr><th>Accel (X,Y,Z)</th><td>${data.aX.toFixed(2)}, ${data.aY.toFixed(2)}, ${data.aZ.toFixed(2)}</td></tr>
               <tr><th>Obstacle Dist</th><td>${data.obsDist} cm</td></tr>
+              <tr><th>GPS Satellites</th><td>${data.sat}</td></tr>
             </table>
           `;
+        })
+        .catch(err => {
+          document.getElementById('data').innerHTML = `<span style="color:red">DATA ERROR: ${err}</span>`;
         });
     }, 200);
   </script>
@@ -453,12 +545,38 @@ void calculateHeading() {
   if (heading > 360) heading -= 360;
 }
 
+void readGPS() {
+  while (GPSSerial.available() > 0) {
+    gps.encode(GPSSerial.read());
+  }
+
+  if (gps.location.isValid()) {
+    gpsLat = gps.location.lat();
+    gpsLng = gps.location.lng();
+    gpsFix = true;
+  }
+
+  if (gps.speed.isValid()) {
+    gpsSpeed = gps.speed.kmph();
+  }
+
+  if (gps.satellites.isValid()) {
+    gpsSat = gps.satellites.value();
+  }
+}
+
 // ================= WEB SERVER LOGIC =================
 
 void handleWebRequests() {
-  server.on("/", []() { server.send(200, "text/html", INDEX_HTML); });
+  server.on("/", []() {
+    server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    server.sendHeader("Pragma", "no-cache");
+    server.sendHeader("Expires", "0");
+    server.send(200, "text/html", INDEX_HTML);
+  });
 
   server.on("/data", []() {
+    server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
     int progress = 0;
     if (isCalibratingMag) progress = (int)(((float)magCalSamplesCollected / REQUIRED_UNIQUE_SAMPLES) * 100);
 
@@ -477,7 +595,11 @@ void handleWebRequests() {
     json += "\"tilted\":" + String(isTilted ? "true" : "false") + ",";
     json += "\"crashed\":" + String(isCrashed ? "true" : "false") + ",";
     json += "\"repelling\":" + String(isRepelling ? "true" : "false") + ",";
-    json += "\"obsDist\":" + String(currentDist);
+    json += "\"obsDist\":" + String(currentDist) + ",";
+    json += "\"lat\":" + String(gpsLat, 6) + ",";
+    json += "\"lng\":" + String(gpsLng, 6) + ",";
+    json += "\"speed\":" + String(gpsSpeed, 2) + ",";
+    json += "\"sat\":" + String(gpsSat);
     json += "}";
     
     server.send(200, "application/json", json);
@@ -531,6 +653,9 @@ void setup() {
   initMPU(); 
   initMag(); 
   loadCalibration();
+
+  GPSSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.println("[GPS] NEO-6M initialized on UART1");
   
   WiFi.softAP("ESP32_TELEMETRY", "12345678");
   Serial.print("[WIFI] Access Point Started. IP: "); Serial.println(WiFi.softAPIP());
@@ -542,6 +667,7 @@ void loop() {
   readMPU();
   readMag(); // THIS IS WHAT WAS MISSING!
   calculateHeading();
+  readGPS();
   
   runCarSafetyLogic(); 
   
