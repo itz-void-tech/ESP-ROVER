@@ -2,8 +2,10 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <HardwareSerial.h>
 #include <TinyGPSPlus.h>
 #include <math.h>
+#include <ESP32Servo.h>
 
 // ================= PINS & CONFIG =================
 #define I2C_SDA 8
@@ -26,13 +28,22 @@
 #define IN4 14
 #define ENB 15
 
+// === PAN TILT SERVOS ===
+#define PAN_PIN 41
+#define TILT_PIN 42
+
 const int REQUIRED_UNIQUE_SAMPLES = 800; 
 
 // ================= GLOBALS =================
 WebServer server(80);
 Preferences preferences;
 TinyGPSPlus gps;
-HardwareSerial GPSSerial(1);
+HardwareSerial GPS_Serial(1);
+
+double gpsLat = 0;
+double gpsLng = 0;
+double gpsSpeed = 0;
+int gpsSat = 0;
 
 bool mpuOk = false;
 bool magOk = false;
@@ -58,6 +69,11 @@ float magMinZ = 32767, magMaxZ = -32768;
 
 unsigned long lastConsoleUpdate = 0;
 
+Servo panServo;
+Servo tiltServo;
+int panAngle = 90;
+int tiltAngle = 90;
+
 // === CAR GLOBALS ===
 int motorSpeed = 178; 
 char currentDir = 'S';
@@ -69,252 +85,299 @@ bool userHornActive = false;
 unsigned long lastObstacleCheck = 0;
 unsigned long crashTime = 0;
 
-// === GPS GLOBALS ===
-double gpsLat = 0.0;
-double gpsLng = 0.0;
-float gpsSpeed = 0.0f; // km/h
-int gpsSat = 0;
-bool gpsFix = false;
-
 // ================= WEB DASHBOARD HTML/CSS/JS =================
 const char INDEX_HTML[] PROGMEM = R"=====(
 <!DOCTYPE html>
 <html>
 <head>
-  <title>ESP32 Advanced Telemetry & Control</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-  <style>
-    body { background-color: #0d1117; color: #00ff00; font-family: 'Courier New', Courier, monospace; margin: 10px; display: flex; flex-direction: column; align-items: center;}
-    h1 { color: #58a6ff; border-bottom: 1px solid #30363d; padding-bottom: 10px; width: 100%; text-align: center; font-size: 1.2em;}
-    .container { max-width: 1200px; width: 100%; display: grid; grid-template-columns: repeat(auto-fit, minmax(320px,1fr)); gap: 15px; }
-    .card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 15px; margin-bottom: 0; }
-    button { background: #238636; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-weight: bold; margin-right: 10px; width: 100%; margin-bottom: 10px;}
-    button:hover { background: #2ea043; }
-    .btn-danger { background: #da3633; }
-    .btn-danger:hover { background: #f85149; }
-    button:disabled { background: #444; cursor: not_allowed; }
-    table { width: 100%; text-align: left; font-size: 0.8em; }
-    th, td { padding: 3px; }
-    
-    #progress-container { width: 100%; background-color: #30363d; border-radius: 5px; margin: 10px 0; display: none; }
-    #progress-bar { width: 0%; height: 20px; background-color: #238636; text-align: center; line-height: 20px; color: white; border-radius: 5px; transition: width 0.1s; }
-    #instructions { color: #8b949e; font-size: 0.85em; display: none; border-left: 3px solid #f2cc60; padding-left: 10px; margin-bottom: 10px;}
+<title>ESP32 Advanced Telemetry & Control</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 
-    #compass-svg { width: 150px; height: 150px; display: block; margin: 10px auto; }
-    .compass-ring { stroke: #30363d; stroke-width: 2; fill: none; }
-    .compass-degree-mark { stroke: #30363d; stroke-width: 1; }
-    .compass-text { fill: #8b949e; font-size: 14px; text-anchor: middle; font-family: sans-serif;}
-    .compass-text-main { fill: #ffffff; font-weight: bold; font-size: 18px;}
-    #compass-needle { fill: #da3633; transition: transform 0.2s ease-out; transform-origin: 75px 75px; }
-    #heading-val { font-size: 2em; color: #58a6ff; text-align: center; }
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
 
-    .drive-btn { background: #444; padding: 20px 5px; margin: 2px; }
-    .drive-btn:active { background: #58a6ff; }
-    #car-status { color: #00ff00; text-align: center; font-weight: bold; margin-bottom: 10px; font-size: 1.1em; transition: 0.2s;}
-    input[type=range] { width: 90%; margin: 15px 0; }
-    .speed-label { font-size: 1.1em; font-weight: bold; color: #58a6ff; }
-    #map { width: 100%; height: 260px; border: 1px solid #30363d; border-radius: 6px; }
-    #real-speed { font-size: 1.2em; color: #58a6ff; font-weight: bold; margin-top: 10px; text-align: center; }
-    #gps-meta { text-align: center; color: #8b949e; font-size: 0.9em; margin-top: 4px; }
-    @media (max-width: 480px) {
-      #map { height: 220px; }
-    }
+<style>
 
-    /* Mobile full-screen control layout */
-    @media (max-width: 768px) {
-      body { margin: 6px; min-height: 100dvh; overflow-y: auto; }
-      h1 { margin: 0 0 6px 0; padding-bottom: 6px; font-size: 0.95em; }
-      .container {
-        max-width: 100%;
-        width: 100%;
-        min-height: calc(100dvh - 52px);
-        grid-template-columns: 1fr 1fr;
-        grid-template-rows: repeat(2, minmax(0, 1fr));
-        grid-template-areas:
-          "gps controls"
-          "compass controls";
-        gap: 6px;
-      }
-      .card { padding: 8px; overflow: hidden; }
-      .card h3 { margin: 0 0 6px 0; font-size: 0.9em; }
-      #gps-card { grid-area: gps; }
-      #controls-card { grid-area: controls; }
-      #compass-card { grid-area: compass; }
-      #cal-card, #telemetry-card { display: none; }
-      #map { height: 68%; min-height: 120px; }
-      #real-speed { font-size: 1em; margin-top: 6px; }
-      #gps-meta { font-size: 0.8em; }
-      #compass-svg { width: 100px; height: 100px; margin: 4px auto; }
-      #heading-val { font-size: 1.2em; }
-      .drive-btn { padding: 12px 4px; font-size: 0.78em; margin: 1px; }
-      button { margin-bottom: 6px; padding: 8px 6px; }
-      input[type=range] { width: 100%; margin: 8px 0; }
-      .speed-label { font-size: 0.95em; }
-      #car-status { margin-bottom: 6px; font-size: 0.9em; }
-    }
-  </style>
+body{
+background:#0d1117;
+color:#00ff00;
+font-family:'Courier New', monospace;
+margin:0;
+padding:15px;
+}
+
+h1{
+color:#58a6ff;
+text-align:center;
+margin-bottom:20px;
+}
+
+.container{
+max-width:1200px;
+margin:auto;
+display:grid;
+grid-template-columns:repeat(auto-fit,minmax(320px,1fr));
+gap:15px;
+}
+
+.card{
+background:#161b22;
+border:1px solid #30363d;
+border-radius:8px;
+padding:15px;
+}
+
+button{
+background:#238636;
+color:white;
+border:none;
+padding:12px;
+border-radius:6px;
+cursor:pointer;
+font-weight:bold;
+width:100%;
+}
+
+button:hover{
+background:#2ea043;
+}
+
+.btn-danger{
+background:#da3633;
+}
+
+.drive-grid{
+display:grid;
+grid-template-columns:repeat(3,1fr);
+gap:6px;
+text-align:center;
+}
+
+.drive-btn{
+background:#444;
+padding:18px 10px;
+font-size:16px;
+}
+
+.drive-btn:active{
+background:#58a6ff;
+}
+
+.speed-label{
+font-size:1.1em;
+color:#58a6ff;
+font-weight:bold;
+}
+
+#car-status{
+text-align:center;
+font-weight:bold;
+margin-bottom:10px;
+}
+
+#map{
+width:100%;
+height:40vh;
+min-height:280px;
+border-radius:8px;
+}
+
+table{
+width:100%;
+font-size:0.85em;
+}
+
+th,td{
+padding:4px;
+}
+
+#heading-val{
+font-size:2em;
+color:#58a6ff;
+text-align:center;
+margin-bottom:10px;
+}
+
+#compass-svg{
+display:block;
+margin:auto;
+width:150px;
+height:150px;
+}
+
+</style>
 </head>
+
 <body>
-  <h1>[ ESP32-S3 ] TELEMETRY & CONTROL</h1>
-  <div style="width:100%;max-width:1200px;display:flex;justify-content:flex-end;margin-bottom:8px;">
-    <button style="width:auto;margin:0;padding:8px 12px;" onclick="refreshDashboard()">Refresh</button>
-  </div>
-  
-  <div class="container">
-    <div class="card" id="gps-card">
-      <h3>GPS MAP + SPEED</h3>
-      <div id="map"></div>
-      <div id="real-speed">REAL SPEED: 0.00 km/h</div>
-      <div id="gps-meta">SAT: <span id="sat-val">0</span></div>
-    </div>
 
-    <div class="card" id="cal-card">
-      <h3>MAGNETOMETER CALIBRATION</h3>
-      <div id="instructions">
-        <strong>ACTION REQUIRED:</strong><br>
-        1. Keep sensor FLAT for 2 seconds.<br>
-        2. Rotate in a slow Figure-8 in the air.<br>
-        3. Tilt diagonally while rotating.
-      </div>
-      <div id="progress-container"><div id="progress-bar">0%</div></div>
-      <p id="cal-status" style="color:#00ff00; text-align:center;">Status: IDLE</p>
-      <button id="btn-start" onclick="startCalibration()">Start Real Calibration</button>
-      <button class="btn-danger" id="btn-reset" onclick="fetch('/reset_cal')">Reset to Defaults</button>
-    </div>
+<h1>[ ESP32-S3 ] TELEMETRY & CONTROL</h1>
 
-    <div class="card" id="controls-card">
-      <h3>CAR CONTROLS</h3>
-      <div id="car-status">SYSTEM READY</div>
-      <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap: 5px; text-align:center;">
-         <div></div>
-         <button class="drive-btn" onmousedown="drive('F')" onmouseup="drive('S')" ontouchstart="drive('F')" ontouchend="drive('S')">FWD</button>
-         <div></div>
-         
-         <button class="drive-btn" onmousedown="drive('L')" onmouseup="drive('S')" ontouchstart="drive('L')" ontouchend="drive('S')">LEFT</button>
-         <button class="drive-btn btn-danger" onmousedown="horn(1)" onmouseup="horn(0)" ontouchstart="horn(1)" ontouchend="horn(0)">HORN</button>
-         <button class="drive-btn" onmousedown="drive('R')" onmouseup="drive('S')" ontouchstart="drive('R')" ontouchend="drive('S')">RIGHT</button>
-         
-         <div></div>
-         <button class="drive-btn" onmousedown="drive('B')" onmouseup="drive('S')" ontouchstart="drive('B')" ontouchend="drive('S')">REV</button>
-         <div></div>
-      </div>
-      
-      <div style="text-align: center; margin-top: 20px; border-top: 1px solid #30363d; padding-top: 15px;">
-        <span class="speed-label">SPEED: <span id="speed-val">70</span>%</span><br>
-        <input type="range" id="speed-slider" min="0" max="100" value="70" 
-               oninput="document.getElementById('speed-val').innerText = this.value" 
-               onchange="updateSpeed(this.value)">
-      </div>
-    </div>
+<div class="container">
 
-    <div class="card" id="compass-card">
-      <div id="heading-val">0.0&deg;</div>
-      <svg id="compass-svg" viewBox="0 0 150 150">
-        <circle class="compass-ring" cx="75" cy="75" r="70"/>
-        <line class="compass-degree-mark" x1="75" y1="5" x2="75" y2="15" /> <line class="compass-degree-mark" x1="145" y1="75" x2="135" y2="75" /> <line class="compass-degree-mark" x1="75" y1="145" x2="75" y2="135" /> <line class="compass-degree-mark" x1="5" y1="75" x2="15" y2="75" /> <text x="75" y="30" class="compass-text compass-text-main">N</text>
-        <text x="130" y="80" class="compass-text">E</text> <text x="75" y="135" class="compass-text">S</text> <text x="20" y="80" class="compass-text">W</text>
-        <g id="compass-needle">
-          <polygon points="75,10 85,75 75,90 65,75" />
-          <circle cx="75" cy="75" r="5" fill="#58a6ff"/>
-        </g>
-      </svg>
-    </div>
+<div class="card">
+<h3>GPS MAP & SPEED</h3>
+<div id="map"></div>
+<div style="text-align:center;margin-top:10px;">
+<span class="speed-label">REAL SPEED:</span>
+<span id="gpsSpeed">0</span> km/h
+</div>
+</div>
 
-    <div class="card" id="telemetry-card">
-      <h3>SYSTEM DATA</h3>
-      <div id="data">Loading...</div>
-    </div>
-  </div>
+<div class="card">
+<h3>CAMERA PAN/TILT</h3>
+<div class="drive-grid">
+<div></div>
+<button class="drive-btn" onmousedown="panTilt('U')">UP</button>
+<div></div>
+<button class="drive-btn" onmousedown="panTilt('L')">LEFT</button>
+<button class="drive-btn" onmousedown="panTilt('C')">CEN</button>
+<button class="drive-btn" onmousedown="panTilt('R')">RIGHT</button>
+<div></div>
+<button class="drive-btn" onmousedown="panTilt('D')">DOWN</button>
+<div></div>
+</div>
+</div>
 
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script>
-    let map = null;
-    let roverMarker = null;
+<div class="card">
 
-    if (window.L) {
-      map = L.map('map').setView([0, 0], 16);
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        maxZoom: 19,
-        attribution: '&copy; OpenStreetMap contributors'
-      }).addTo(map);
+<h3>CAR CONTROLS</h3>
 
-      roverMarker = L.marker([0, 0]).addTo(map);
+<div id="car-status">SYSTEM READY</div>
 
-      // Fix Leaflet rendering inside responsive grid
-      setTimeout(() => map.invalidateSize(), 200);
-    } else {
-      document.getElementById('map').innerHTML = "<div style='display:flex;align-items:center;justify-content:center;height:100%;color:#8b949e;'>Map unavailable (no internet for Leaflet)</div>";
-    }
+<div class="drive-grid">
 
-    function updateMap(lat, lng) {
-      if (map && roverMarker && !isNaN(lat) && !isNaN(lng) && (lat !== 0 || lng !== 0)) {
-        roverMarker.setLatLng([lat, lng]);
-        map.setView([lat, lng], map.getZoom());
-      }
-    }
+<div></div>
+<button class="drive-btn"
+onmousedown="drive('F')" onmouseup="drive('S')"
+ontouchstart="drive('F')" ontouchend="drive('S')">FWD</button>
+<div></div>
 
-    function startCalibration() {
-      document.getElementById('instructions').style.display = 'block';
-      document.getElementById('progress-container').style.display = 'block';
-      document.getElementById('btn-start').disabled = true;
-      document.getElementById('btn-reset').disabled = true;
-      fetch('/start_cal');
-    }
+<button class="drive-btn"
+onmousedown="drive('L')" onmouseup="drive('S')"
+ontouchstart="drive('L')" ontouchend="drive('S')">LEFT</button>
 
-    function drive(dir) { fetch('/move?dir=' + dir); }
-    function horn(state) { fetch('/horn?s=' + state); }
-    function updateSpeed(val) { fetch('/speed?v=' + val); }
-    function refreshDashboard() { window.location.href = '/?t=' + Date.now(); }
+<button class="drive-btn btn-danger"
+onmousedown="horn(1)" onmouseup="horn(0)"
+ontouchstart="horn(1)" ontouchend="horn(0)">HORN</button>
 
-    setInterval(() => {
-      fetch('/data')
-        .then(response => response.json())
-        .then(data => {
-          document.getElementById('compass-needle').style.transform = `rotate(${data.heading}deg)`;
-          document.getElementById('heading-val').innerHTML = `${data.heading.toFixed(1)}&deg;`;
-          document.getElementById('real-speed').innerText = `REAL SPEED: ${data.speed.toFixed(2)} km/h`;
-          document.getElementById('sat-val').innerText = data.sat;
-          updateMap(data.lat, data.lng);
+<button class="drive-btn"
+onmousedown="drive('R')" onmouseup="drive('S')"
+ontouchstart="drive('R')" ontouchend="drive('S')">RIGHT</button>
 
-          let statusEl = document.getElementById('car-status');
-          if (data.crashed) {
-            statusEl.innerHTML = "<span style='color:red; font-size:1.3em;'>🚨 CRASH DETECTED 🚨</span>";
-          } else if (data.fallen) {
-            statusEl.innerHTML = "<span style='color:red'>WARNING: VEHICLE OVERTURNED!</span>";
-          } else if (data.repelling) {
-            statusEl.innerHTML = "<span style='color:#ff00ff'>REPULSION: OBJECT TOO CLOSE!</span>";
-          } else if (data.tilted) {
-            statusEl.innerHTML = "<span style='color:orange'>WARNING: HIGH TILT ANGLE</span>";
-          } else {
-            statusEl.innerHTML = "SYSTEM NOMINAL";
-          }
+<div></div>
+<button class="drive-btn"
+onmousedown="drive('B')" onmouseup="drive('S')"
+ontouchstart="drive('B')" ontouchend="drive('S')">REV</button>
+<div></div>
 
-          if(data.calibrating) {
-            document.getElementById('cal-status').innerText = `Status: COLLECTING DATA...`;
-            document.getElementById('cal-status').style.color = "#f2cc60";
-            document.getElementById('progress-bar').style.width = `${data.cal_pct}%`;
-            document.getElementById('progress-bar').innerText = `${data.cal_pct}%`;
-          } else {
-            document.getElementById('cal-status').innerText = "Status: IDLE (Offsets active)";
-            document.getElementById('cal-status').style.color = "#00ff00";
-          }
+</div>
 
-          document.getElementById('data').innerHTML = `
-            <table>
-              <tr><th>Mag Sensor</th><td>${data.magOk ? 'OK ('+data.magType+')' : '<span style="color:red">FAIL</span>'}</td></tr>
-              <tr><th>Mag Offsets</th><td>X:${data.offX}, Y:${data.offY}, Z:${data.offZ}</td></tr>
-              <tr><th>Accel (X,Y,Z)</th><td>${data.aX.toFixed(2)}, ${data.aY.toFixed(2)}, ${data.aZ.toFixed(2)}</td></tr>
-              <tr><th>Obstacle Dist</th><td>${data.obsDist} cm</td></tr>
-              <tr><th>GPS Satellites</th><td>${data.sat}</td></tr>
-            </table>
-          `;
-        })
-        .catch(err => {
-          document.getElementById('data').innerHTML = `<span style="color:red">DATA ERROR: ${err}</span>`;
-        });
-    }, 200);
-  </script>
+<div style="margin-top:20px;text-align:center">
+
+<span class="speed-label">SPEED: <span id="speed-val">70</span>%</span>
+
+<input type="range"
+id="speed-slider"
+min="0"
+max="100"
+value="70"
+style="width:100%;margin-top:10px"
+oninput="speedVal(this.value)"
+onchange="updateSpeed(this.value)">
+
+</div>
+
+</div>
+
+<div class="card">
+
+<div id="heading-val">0°</div>
+
+<svg id="compass-svg" viewBox="0 0 150 150">
+
+<circle cx="75" cy="75" r="70" stroke="#30363d" stroke-width="2" fill="none"/>
+
+<text x="75" y="30" fill="white" text-anchor="middle">N</text>
+<text x="130" y="80" fill="white">E</text>
+<text x="75" y="140" fill="white">S</text>
+<text x="20" y="80" fill="white">W</text>
+
+<g id="compass-needle">
+<polygon points="75,10 85,75 75,90 65,75" fill="#da3633"/>
+<circle cx="75" cy="75" r="5" fill="#58a6ff"/>
+</g>
+
+</svg>
+
+</div>
+
+<div class="card">
+
+<h3>SYSTEM DATA</h3>
+<div id="data">Loading...</div>
+
+</div>
+
+</div>
+
+<script>
+
+function drive(dir){ fetch('/move?dir='+dir) }
+
+function horn(s){ fetch('/horn?s='+s) }
+
+function updateSpeed(v){ fetch('/speed?v='+v) }
+
+function panTilt(cmd){ fetch('/pantilt?cmd='+cmd) }
+
+function speedVal(v){
+document.getElementById("speed-val").innerText=v
+}
+
+var map=L.map('map').setView([0,0],16)
+
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+maxZoom:19
+}).addTo(map)
+
+var marker=L.marker([0,0]).addTo(map)
+
+setInterval(()=>{
+
+fetch('/data')
+.then(r=>r.json())
+.then(data=>{
+
+document.getElementById('compass-needle').style.transform =
+`rotate(${data.heading}deg)`
+
+document.getElementById('heading-val').innerHTML =
+`${data.heading.toFixed(1)}°`
+
+document.getElementById("gpsSpeed").innerText =
+data.speed.toFixed(1)
+
+if(data.lat!=0 && data.lng!=0){
+marker.setLatLng([data.lat,data.lng])
+map.setView([data.lat,data.lng])
+}
+
+document.getElementById('data').innerHTML=
+`
+<table>
+<tr><th>Mag Sensor</th><td>${data.magOk ? 'OK ('+data.magType+')':'FAIL'}</td></tr>
+<tr><th>Accel</th><td>${data.aX.toFixed(2)}, ${data.aY.toFixed(2)}, ${data.aZ.toFixed(2)}</td></tr>
+<tr><th>Obstacle</th><td>${data.obsDist} cm</td></tr>
+<tr><th>Satellites</th><td>${data.sat}</td></tr>
+</table>
+`
+
+})
+
+},200)
+
+</script>
+
 </body>
 </html>
 )=====";
@@ -333,13 +396,15 @@ void moveCar(char dir) {
   currentDir = dir;
   switch (dir) {
     case 'F': 
-      digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
-      digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+      // Swapped Direction: LOW, HIGH corresponds to true Forward
+      digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+      digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
       analogWrite(ENA, motorSpeed); analogWrite(ENB, motorSpeed);
       break;
     case 'B': 
-      digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
-      digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+      // Swapped Direction: HIGH, LOW corresponds to true Backward
+      digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+      digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
       analogWrite(ENA, motorSpeed); analogWrite(ENB, motorSpeed);
       break;
     case 'L': 
@@ -397,7 +462,7 @@ void runCarSafetyLogic() {
   // 3. Obstacle Repulsion
   if (millis() - lastObstacleCheck > 100) {
     long dist = getUltrasonicDistance();
-    if (dist > 0 && dist < 10 && !isFallen && !isCrashed) {
+    if (dist > 0 && dist < 25 && !isFallen && !isCrashed) {
       if (!isRepelling) isRepelling = true;
       moveCar('B'); 
     } else {
@@ -545,38 +610,12 @@ void calculateHeading() {
   if (heading > 360) heading -= 360;
 }
 
-void readGPS() {
-  while (GPSSerial.available() > 0) {
-    gps.encode(GPSSerial.read());
-  }
-
-  if (gps.location.isValid()) {
-    gpsLat = gps.location.lat();
-    gpsLng = gps.location.lng();
-    gpsFix = true;
-  }
-
-  if (gps.speed.isValid()) {
-    gpsSpeed = gps.speed.kmph();
-  }
-
-  if (gps.satellites.isValid()) {
-    gpsSat = gps.satellites.value();
-  }
-}
-
 // ================= WEB SERVER LOGIC =================
 
 void handleWebRequests() {
-  server.on("/", []() {
-    server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-    server.sendHeader("Pragma", "no-cache");
-    server.sendHeader("Expires", "0");
-    server.send(200, "text/html", INDEX_HTML);
-  });
+  server.on("/", []() { server.send(200, "text/html", INDEX_HTML); });
 
   server.on("/data", []() {
-    server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
     int progress = 0;
     if (isCalibratingMag) progress = (int)(((float)magCalSamplesCollected / REQUIRED_UNIQUE_SAMPLES) * 100);
 
@@ -595,11 +634,7 @@ void handleWebRequests() {
     json += "\"tilted\":" + String(isTilted ? "true" : "false") + ",";
     json += "\"crashed\":" + String(isCrashed ? "true" : "false") + ",";
     json += "\"repelling\":" + String(isRepelling ? "true" : "false") + ",";
-    json += "\"obsDist\":" + String(currentDist) + ",";
-    json += "\"lat\":" + String(gpsLat, 6) + ",";
-    json += "\"lng\":" + String(gpsLng, 6) + ",";
-    json += "\"speed\":" + String(gpsSpeed, 2) + ",";
-    json += "\"sat\":" + String(gpsSat);
+    json += "\"obsDist\":" + String(currentDist);
     json += "}";
     
     server.send(200, "application/json", json);
@@ -613,6 +648,18 @@ void handleWebRequests() {
   server.on("/speed", []() {
     int percentage = server.arg("v").toInt();
     motorSpeed = map(percentage, 0, 100, 0, 255);
+    server.send(200, "text/plain", "OK");
+  });
+  
+  server.on("/pantilt", []() {
+    char cmd = server.arg("cmd")[0];
+    if (cmd == 'U') { tiltAngle -= 10; if (tiltAngle < 0) tiltAngle = 0; }
+    else if (cmd == 'D') { tiltAngle += 10; if (tiltAngle > 180) tiltAngle = 180; }
+    else if (cmd == 'L') { panAngle += 10; if (panAngle > 180) panAngle = 180; }
+    else if (cmd == 'R') { panAngle -= 10; if (panAngle < 0) panAngle = 0; }
+    else if (cmd == 'C') { panAngle = 90; tiltAngle = 90; }
+    panServo.write(panAngle);
+    tiltServo.write(tiltAngle);
     server.send(200, "text/plain", "OK");
   });
   
@@ -649,27 +696,50 @@ void setup() {
   pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
   pinMode(ENB, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
 
+  panServo.setPeriodHertz(50);
+  tiltServo.setPeriodHertz(50);
+  panServo.attach(PAN_PIN, 500, 2400);
+  tiltServo.attach(TILT_PIN, 500, 2400);
+  panServo.write(panAngle);
+  tiltServo.write(tiltAngle);
+
   scanI2C();
   initMPU(); 
   initMag(); 
   loadCalibration();
-
-  GPSSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-  Serial.println("[GPS] NEO-6M initialized on UART1");
   
   WiFi.softAP("ESP32_TELEMETRY", "12345678");
   Serial.print("[WIFI] Access Point Started. IP: "); Serial.println(WiFi.softAPIP());
-  
+  // ===== START GPS INIT =====
+  GPS_Serial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.println("[GPS] Serial Started");
+  // ===== END GPS INIT =====
   handleWebRequests();
 }
 
 void loop() {
   readMPU();
   readMag(); // THIS IS WHAT WAS MISSING!
-  calculateHeading();
-  readGPS();
-  
+  calculateHeading();  
   runCarSafetyLogic(); 
+  // ===== START GPS READING =====
+  while (GPS_Serial.available()) {
+    gps.encode(GPS_Serial.read());
+  }
+  
+  if (gps.location.isUpdated()) {
+    gpsLat = gps.location.lat();
+    gpsLng = gps.location.lng();
+  }
+  
+  if (gps.speed.isUpdated()) {
+    gpsSpeed = gps.speed.kmph();
+  }
+  
+  if (gps.satellites.isUpdated()) {
+    gpsSat = gps.satellites.value();
+  }
+  // ===== END GPS READING =====
   
   server.handleClient();
 }
